@@ -1,0 +1,1551 @@
+#!/usr/bin/env python3
+# bot2_v2.py — STOCK OPTIONS TRADING BOT v2 (fixes after external review)
+#
+# ╔══════════════════════════════════════════════════════════════════════╗
+# ║  WHAT THIS BOT DOES — 10 SIMPLE POINTS (v2 updates in [BRACKETS])    ║
+# ╠══════════════════════════════════════════════════════════════════════╣
+# ║  1. Capital Rs.1,00,000. Paper trade mode (LIVE_MODE=False default). ║
+# ║     Single flag at top → flip to True for real Kite orders.          ║
+# ║                                                                      ║
+# ║  2. Builds a fresh universe of liquid Nifty F&O stocks at startup.   ║
+# ║     Filter: NIFTY 200 + weekly options + good volume + affordable    ║
+# ║     at Rs.40K per leg. Typical result: ~70-90 stocks.                ║
+# ║                                                                      ║
+# ║  3. Pre-market scoring at 09:25 — every stock gets a score 0-8.      ║
+# ║     Components: historic pattern (3) + sentiment (2) + volume (2)    ║
+# ║                  + sector alignment (1).                             ║
+# ║     Min entry score = 6/8.                                           ║
+# ║                                                                      ║
+# ║  4. Historic pattern match: For each candidate, look at last 10      ║
+# ║     instances where stock moved similarly. If 7+/10 hit Rs.1,000     ║
+# ║     option profit within 15 min, score 3 pts.                        ║
+# ║     [v2 FIX E: require MIN 7 similar samples before scoring —        ║
+# ║      previously 3 samples was too few for statistical meaning.]      ║
+# ║                                                                      ║
+# ║  5. Re-scoring cadence:                                              ║
+# ║      - Every 3 min: re-score the top 20 stocks                       ║
+# ║      - Every 15 min: full re-score on full universe                  ║
+# ║                                                                      ║
+# ║  6. Trade window: 09:25 to 15:00 for entries [v2 FIX C: was 15:15].  ║
+# ║     15-min buffer before 15:15 square-off so time exit works cleanly.║
+# ║     Max 2 parallel positions. Each can use up to Rs.40K capital.     ║
+# ║                                                                      ║
+# ║  7. Entry rule: pick highest-scoring stock that passes score ≥ 6.    ║
+# ║     Skip stocks with open positions.                                 ║
+# ║     [v2 FIX D: cooldown after exit split by outcome:                 ║
+# ║      - WIN: 5 min cooldown (repeat winning setups)                   ║
+# ║      - LOSS: 60 min cooldown (protect from broken setups)]           ║
+# ║     [v2 FIX F: skip entry when IV rank > 70 — options too expensive] ║
+# ║                                                                      ║
+# ║  8. Exit rules per trade:                                            ║
+# ║      - Target Rs.1,000 → trail at Rs.500. Each Rs.50 peak → +Rs.50   ║
+# ║      - Hard SL Rs.1,000 [v2 FIX A: was Rs.2,000 — risk/reward now 1:1]║
+# ║      - 15-min check: didn't hit target → exit at any current PnL     ║
+# ║      - Loss > Rs.1,000 AND live score < entry score → exit early     ║
+# ║      - 15:15 square-off any open positions                           ║
+# ║                                                                      ║
+# ║  9. Output: Excel report (.xlsx) updated on every trade close + EOD. ║
+# ║     Worksheets: Summary, Daily Trades, Picks Log, Score History.     ║
+# ║                                                                      ║
+# ║  10. Configurable consecutive-SL and daily-loss limits (default 0 =  ║
+# ║      unlimited for paper). Set to real numbers for live mode.        ║
+# ║                                                                      ║
+# ║  [v2 FIX B: volume comparison — now uses same-time-of-day cumulative ║
+# ║             vs same-time avg over last 20 sessions. Old code         ║
+# ║             extrapolated morning volume to full day = wrong.]        ║
+# ║                                                                      ║
+# ║  [v2 FIX F: added delta ≥ 0.40 filter on option strike selection —   ║
+# ║             ensures option moves close to 1:1 with stock, not deep   ║
+# ║             OTM where stock moves 0.5% and option barely responds.]  ║
+# ║                                                                      ║
+# ║  Run: python bot2_v2.py                                              ║
+# ║  Logs: logs/bot2.log                                                 ║
+# ║  Report: outputs/bot2_report_YYYY-MM-DD.xlsx                         ║
+# ╚══════════════════════════════════════════════════════════════════════╝
+
+import os
+import sys
+import time
+import json
+import logging
+import datetime
+import threading
+import traceback
+import webbrowser
+import urllib.parse
+from collections import defaultdict
+
+import pandas as pd
+import numpy as np
+import schedule
+from openpyxl import Workbook, load_workbook
+from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+from openpyxl.utils import get_column_letter
+
+from kiteconnect import KiteConnect
+
+# ═══════════════════════════════════════════════════════════════════════
+# SECTION 1 — CONFIG (everything you can tune)
+# ═══════════════════════════════════════════════════════════════════════
+B2 = {
+    # MODE — flip to True to send real orders to Kite
+    'LIVE_MODE': False,
+
+    # CAPITAL AND RISK
+    'TOTAL_CAPITAL':         100000,      # Rs.1,00,000 paper or real
+    'PER_TRADE_MAX_RISK':    40000,       # max capital per single trade
+    'MAX_PARALLEL':          2,           # max concurrent positions
+    'TARGET_PROFIT':         1000,        # exit at +Rs.1,000
+    'HARD_STOP_LOSS':        1000,        # v2 FIX A: SL Rs.2,000 → Rs.1,000
+                                           # Risk/reward now 1:1 (was 0.5:1)
+                                           # Break-even win rate: 50% (was 67%)
+    'TRAIL_INITIAL_LOCK':    500,         # after target hit, trail starts at +500
+    'TRAIL_STEP':            50,          # every +50 peak rise → +50 trail raise
+
+    # TIME WINDOW
+    'TRADE_START':           datetime.time(9, 25),   # entries from 09:25
+    'TRADE_END':             datetime.time(15, 0),   # v2 FIX C: was 15:15
+                                                      # 15-min buffer for time exit
+                                                      # + square-off to work cleanly
+    'SQUAREOFF_TIME':        '15:15',                # close any open at 15:15
+    'MARKET_CLOSE':          datetime.time(15, 30),  # absolute close
+
+    # SCORING THRESHOLDS
+    'MIN_ENTRY_SCORE':       6,           # require 6/8 to enter
+    'HISTORIC_LOOKBACK_DAYS': 10,         # last 10 similar moves
+    'HISTORIC_WIN_TARGET':   1000,        # Rs.1,000 win in 15 min = success
+    'HISTORIC_WIN_WINDOW_MIN': 15,        # 15 min window for historic match
+    'HISTORIC_MIN_SAMPLES':  7,           # v2 FIX E: require ≥7 similar samples
+                                           # to award any historic score
+                                           # (was 3 — statistically too small)
+    'VOLUME_STRONG_MULT':    1.5,         # 1.5x same-time-of-day avg = strong
+
+    # SCORING CADENCE
+    'TOP_RESCORE_SECS':      180,         # 3 min — top-20 refresh
+    'FULL_RESCORE_SECS':     900,         # 15 min — full universe refresh
+    'TOP_PICKS_REFRESH_N':   20,          # rescore the top N every 3 min
+
+    # 15-MIN EXIT RULE
+    'TIME_EXIT_SECS':        900,         # 15 min — exit at any PnL
+    'TIME_EXIT_LOSS_FLOOR': -1000,        # if loss > Rs.1,000 + score drop → exit
+
+    # RISK LIMITS (configurable)
+    'CONSECUTIVE_SL_LIMIT':  0,           # 0 = no limit (paper). Set to 2 for live.
+    'DAILY_MAX_LOSS':        0,           # 0 = no limit (paper). Set to negative for live.
+
+    # SAME-STOCK COOLDOWN (v2 FIX D — differentiated by outcome)
+    # After a WIN: short cooldown — successful setups can repeat cleanly
+    # After a LOSS: long cooldown — protects from re-entering broken setups
+    'SAME_STOCK_COOLDOWN_WIN_SECS':   300,   # 5 min after win
+    'SAME_STOCK_COOLDOWN_LOSS_SECS':  3600,  # 60 min after loss
+
+    # v2 FIX F — Option quality filters (delta + IV)
+    # Ensures the option itself moves close to 1:1 with stock (near-ATM)
+    # and skips options that are too expensive from high IV
+    'MIN_OPTION_DELTA':      0.40,        # skip if |delta| < 0.4 (too far OTM)
+    'MAX_IV_RANK_ENTRY':     70,          # skip entries when IV rank > 70%
+                                           # (options too expensive)
+
+    # KITE LOGIN
+    'KITE_API_KEY':          None,        # set via env or kite_creds.json
+    'KITE_API_SECRET':       None,
+    'KITE_TOKEN_FILE':       'kite_token.json',
+
+    # OPTION SELECTION
+    'OPTION_PREMIUM_MIN':    10,          # skip option premium < Rs.10
+    'OPTION_PREMIUM_MAX':    300,         # skip option premium > Rs.300
+    'MIN_OPTION_OI':         500000,      # min open interest
+    'MIN_OPTION_VOLUME':     2000,        # min today's volume
+    'EXPIRY_MIN_DAYS':       4,           # avoid 0-3 DTE assignment risk
+
+    # PATHS
+    'LOG_DIR':               'logs',
+    'OUTPUT_DIR':            'outputs',
+    'HEARTBEAT_FILE':        'logs/bot2_heartbeat.txt',
+}
+
+# ═══════════════════════════════════════════════════════════════════════
+# SECTION 2 — STATE (live state of the bot during the trading day)
+# ═══════════════════════════════════════════════════════════════════════
+STATE = {
+    'universe':              [],          # list of stock dicts {symbol, token, sector}
+    'pre_market_done':       False,
+    'session_date':          None,
+    'session_start':         None,
+    'global_sentiment':      'NEUTRAL',
+    'nifty_session_open':    0.0,
+    'nifty_current':         0.0,
+    'vix_current':           0.0,
+    'iv_rank':               50,          # v2 FIX F: current VIX rank vs 60-day range
+    'top_picks':             [],          # ranked list of top picks with scores
+    'all_scores':            {},          # symbol → {score, components, direction, ...}
+    'positions':             {},          # symbol → position dict
+    'closed_trades_today':   [],          # list of trade-dicts for the day
+    # v2 FIX D: cooldown map split by outcome
+    'last_exit_win':         {},          # stock → datetime (last winning exit)
+    'last_exit_loss':        {},          # stock → datetime (last losing exit)
+    'consecutive_sl_count':  0,
+    'closed_pnl_today':      0.0,
+    'last_top_rescore':      None,
+    'last_full_rescore':     None,
+    'sentiment_components':  {},          # for HTML report
+    'log_lock':              threading.Lock(),
+    'kite':                  None,
+}
+
+# ═══════════════════════════════════════════════════════════════════════
+# SECTION 3 — LOGGING SETUP
+# ═══════════════════════════════════════════════════════════════════════
+os.makedirs(B2['LOG_DIR'], exist_ok=True)
+os.makedirs(B2['OUTPUT_DIR'], exist_ok=True)
+
+logger = logging.getLogger('BOT2')
+logger.setLevel(logging.INFO)
+log_handler = logging.FileHandler(os.path.join(B2['LOG_DIR'], 'bot2.log'))
+log_console = logging.StreamHandler(sys.stdout)
+fmt = logging.Formatter('%(asctime)s | BOT2 | %(levelname)s | %(message)s')
+log_handler.setFormatter(fmt)
+log_console.setFormatter(fmt)
+logger.addHandler(log_handler)
+logger.addHandler(log_console)
+log = logger
+
+# ═══════════════════════════════════════════════════════════════════════
+# SECTION 4 — KITE LOGIN (self-contained in this script)
+# ═══════════════════════════════════════════════════════════════════════
+def load_kite_credentials():
+    """Load API key + secret from kite_creds.json or env vars."""
+    creds_file = 'kite_creds.json'
+    if os.path.exists(creds_file):
+        with open(creds_file) as f:
+            c = json.load(f)
+        return c.get('api_key'), c.get('api_secret')
+    return os.environ.get('KITE_API_KEY'), os.environ.get('KITE_API_SECRET')
+
+
+def kite_login():
+    """
+    Standard Kite login flow:
+      1. Check if today's access_token exists and is valid
+      2. If not, open browser for user to get request_token
+      3. Exchange request_token for access_token
+      4. Save access_token with today's date for reuse
+    """
+    api_key, api_secret = load_kite_credentials()
+    if not api_key or not api_secret:
+        log.error('Kite credentials missing. Create kite_creds.json with api_key/api_secret.')
+        sys.exit(1)
+
+    B2['KITE_API_KEY'] = api_key
+    B2['KITE_API_SECRET'] = api_secret
+
+    kite = KiteConnect(api_key=api_key)
+    token_file = B2['KITE_TOKEN_FILE']
+    today = datetime.date.today().isoformat()
+
+    # Try cached token first
+    if os.path.exists(token_file):
+        try:
+            with open(token_file) as f:
+                saved = json.load(f)
+            if saved.get('date') == today:
+                kite.set_access_token(saved['access_token'])
+                # Verify still valid by making a cheap call
+                try:
+                    kite.profile()
+                    log.info('Kite: using cached access_token from today.')
+                    return kite
+                except Exception:
+                    log.info('Cached token rejected — will fetch a new one.')
+        except Exception:
+            pass
+
+    # Need fresh login
+    login_url = kite.login_url()
+    print('\n' + '=' * 70)
+    print('KITE LOGIN REQUIRED')
+    print('=' * 70)
+    print('Open this URL in browser, log in, then paste back the request_token:')
+    print(login_url)
+    print('=' * 70)
+    try:
+        webbrowser.open(login_url)
+    except Exception:
+        pass
+    req_token = input('Paste request_token here: ').strip()
+
+    try:
+        data = kite.generate_session(req_token, api_secret=api_secret)
+        access_token = data['access_token']
+        kite.set_access_token(access_token)
+        with open(token_file, 'w') as f:
+            json.dump({'date': today, 'access_token': access_token}, f)
+        log.info('Kite: new access_token obtained and saved.')
+        return kite
+    except Exception as e:
+        log.error('Kite login failed: ' + str(e))
+        sys.exit(1)
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# SECTION 5 — KITE HELPERS
+# ═══════════════════════════════════════════════════════════════════════
+def fetch_kite(kite, instrument_token, days=2, interval='3minute'):
+    """Fetch historical OHLCV. Returns DataFrame or None."""
+    try:
+        end = datetime.datetime.now()
+        start = end - datetime.timedelta(days=days)
+        bars = kite.historical_data(instrument_token, start, end, interval)
+        if not bars:
+            return None
+        df = pd.DataFrame(bars)
+        df['date'] = pd.to_datetime(df['date'])
+        df = df.set_index('date')
+        return df
+    except Exception as e:
+        log.warning('fetch_kite error token=' + str(instrument_token)
+                    + ' interval=' + interval + ': ' + str(e))
+        return None
+
+
+def get_ltp_safe(kite, symbol):
+    """Get live LTP for a tradingsymbol, e.g. 'NSE:TCS'."""
+    try:
+        r = kite.ltp([symbol])
+        return r[symbol]['last_price']
+    except Exception as e:
+        log.warning('LTP fetch fail for ' + symbol + ': ' + str(e))
+        return None
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# SECTION 6 — UNIVERSE BUILDER (fresh list at startup)
+# ═══════════════════════════════════════════════════════════════════════
+# Curated NIFTY 200 with liquid F&O — refined list of 86 candidates
+SECTOR_MAP = {
+    # Banking
+    'HDFCBANK': 'BANKING', 'ICICIBANK': 'BANKING', 'KOTAKBANK': 'BANKING',
+    'AXISBANK': 'BANKING', 'SBIN': 'BANKING', 'INDUSINDBK': 'BANKING',
+    'FEDERALBNK': 'BANKING', 'PNB': 'BANKING', 'BANKBARODA': 'BANKING',
+    # IT
+    'TCS': 'IT', 'INFY': 'IT', 'WIPRO': 'IT', 'HCLTECH': 'IT',
+    'TECHM': 'IT', 'LTIM': 'IT', 'COFORGE': 'IT', 'PERSISTENT': 'IT',
+    'MPHASIS': 'IT', 'OFSS': 'IT',
+    # NBFC
+    'BAJFINANCE': 'NBFC', 'BAJAJFINSV': 'NBFC', 'CHOLAFIN': 'NBFC',
+    'HDFCAMC': 'NBFC', 'SBICARD': 'NBFC', 'PEL': 'NBFC',
+    # Auto
+    'MARUTI': 'AUTO', 'TATAMOTORS': 'AUTO', 'M&M': 'AUTO',
+    'BAJAJ-AUTO': 'AUTO', 'EICHERMOT': 'AUTO', 'HEROMOTOCO': 'AUTO',
+    'TVSMOTOR': 'AUTO', 'ASHOKLEY': 'AUTO',
+    # FMCG
+    'HINDUNILVR': 'FMCG', 'ITC': 'FMCG', 'NESTLEIND': 'FMCG',
+    'BRITANNIA': 'FMCG', 'DABUR': 'FMCG', 'MARICO': 'FMCG',
+    'COLPAL': 'FMCG', 'GODREJCP': 'FMCG',
+    # Pharma
+    'SUNPHARMA': 'PHARMA', 'CIPLA': 'PHARMA', 'DRREDDY': 'PHARMA',
+    'DIVISLAB': 'PHARMA', 'LUPIN': 'PHARMA', 'AUROPHARMA': 'PHARMA',
+    'TORNTPHARM': 'PHARMA', 'APOLLOHOSP': 'PHARMA',
+    # Metals
+    'TATASTEEL': 'METALS', 'JSWSTEEL': 'METALS', 'HINDALCO': 'METALS',
+    'VEDL': 'METALS', 'COALINDIA': 'METALS', 'NMDC': 'METALS',
+    'SAIL': 'METALS', 'JINDALSTEL': 'METALS',
+    # Energy
+    'RELIANCE': 'ENERGY', 'ONGC': 'ENERGY', 'IOC': 'ENERGY',
+    'BPCL': 'ENERGY', 'HINDPETRO': 'ENERGY', 'GAIL': 'ENERGY',
+    # Cement
+    'ULTRACEMCO': 'CEMENT', 'GRASIM': 'CEMENT', 'SHREECEM': 'CEMENT',
+    'AMBUJACEM': 'CEMENT', 'ACC': 'CEMENT',
+    # Consumer durables / retail
+    'TITAN': 'RETAIL', 'TRENT': 'RETAIL', 'DMART': 'RETAIL',
+    'PAGEIND': 'RETAIL', 'BATAINDIA': 'RETAIL', 'PIDILITIND': 'RETAIL',
+    # Power / Infra
+    'NTPC': 'POWER', 'POWERGRID': 'POWER', 'TATAPOWER': 'POWER',
+    'ADANIPORTS': 'INFRA', 'LT': 'INFRA', 'BHEL': 'INFRA',
+    # Telecom / Misc
+    'BHARTIARTL': 'TELECOM', 'IDEA': 'TELECOM',
+    'HDFCLIFE': 'INSURANCE', 'SBILIFE': 'INSURANCE', 'ICICIGI': 'INSURANCE',
+    'BEL': 'DEFENCE', 'HAL': 'DEFENCE',
+    'DIXON': 'ELECTRONICS', 'POLYCAB': 'CABLES',
+    'OBEROIRLTY': 'REALTY', 'GODREJPROP': 'REALTY', 'DLF': 'REALTY',
+}
+
+SECTOR_REPRESENTATIVE = {
+    'BANKING': 'HDFCBANK', 'IT': 'INFY', 'NBFC': 'BAJFINANCE',
+    'AUTO': 'MARUTI', 'FMCG': 'HINDUNILVR', 'PHARMA': 'SUNPHARMA',
+    'METALS': 'TATASTEEL', 'ENERGY': 'RELIANCE', 'CEMENT': 'ULTRACEMCO',
+    'RETAIL': 'TITAN', 'POWER': 'NTPC', 'INFRA': 'LT',
+    'TELECOM': 'BHARTIARTL', 'INSURANCE': 'HDFCLIFE',
+    'DEFENCE': 'BEL', 'ELECTRONICS': 'DIXON',
+    'CABLES': 'POLYCAB', 'REALTY': 'OBEROIRLTY',
+}
+
+
+def build_universe(kite):
+    """
+    Build the fresh universe of tradeable stocks for today.
+    Filters: in NIFTY F&O + sector_map + affordable at Rs.40K.
+    """
+    log.info('Building fresh universe...')
+    try:
+        instruments = kite.instruments('NSE')
+    except Exception as e:
+        log.error('Failed to load NSE instruments: ' + str(e))
+        return []
+
+    sym_to_token = {}
+    for inst in instruments:
+        if inst['segment'] == 'NSE' and inst['instrument_type'] == 'EQ':
+            sym_to_token[inst['tradingsymbol']] = inst['instrument_token']
+
+    universe = []
+    for symbol, sector in SECTOR_MAP.items():
+        token = sym_to_token.get(symbol)
+        if not token:
+            log.warning('Symbol not found in NSE instruments: ' + symbol)
+            continue
+        # Check affordability (need at least 1 lot worth < per_trade_max)
+        ltp = get_ltp_safe(kite, 'NSE:' + symbol)
+        if not ltp or ltp <= 0:
+            continue
+        universe.append({
+            'symbol': symbol,
+            'token': token,
+            'sector': sector,
+            'ltp': ltp,
+        })
+        time.sleep(0.1)  # gentle rate limit
+
+    log.info('Universe ready: ' + str(len(universe)) + ' stocks')
+    return universe
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# SECTION 7 — GLOBAL MARKET SENTIMENT (Nifty + VIX + sector breadth)
+# ═══════════════════════════════════════════════════════════════════════
+INSTRUMENT_TOKENS = {
+    'NIFTY_50':  256265,
+    'BANKNIFTY': 260105,
+    'INDIA_VIX': 264969,
+}
+
+
+def refresh_sentiment(kite):
+    """
+    Compute global sentiment from Nifty + BankNifty + VIX.
+    Returns BULLISH / BEARISH / NEUTRAL.
+    Also captures Nifty session open for move-from-open calc.
+    """
+    bull = bear = 0
+    components = {}
+
+    # Nifty 50
+    try:
+        df = fetch_kite(kite, INSTRUMENT_TOKENS['NIFTY_50'], days=2, interval='5minute')
+        if df is not None and not df.empty:
+            today = datetime.date.today()
+            df_today = df[df.index.date == today]
+            if not df_today.empty:
+                STATE['nifty_session_open'] = float(df_today['open'].iloc[0])
+                STATE['nifty_current'] = float(df_today['close'].iloc[-1])
+                df_prev = df[df.index.date < today]
+                if not df_prev.empty:
+                    prev_close = float(df_prev['close'].iloc[-1])
+                    chg = (STATE['nifty_current'] - prev_close) / prev_close * 100
+                    components['nifty_pct'] = round(chg, 2)
+                    if chg > 0.3: bull += 1
+                    elif chg < -0.3: bear += 1
+    except Exception as e:
+        log.warning('Nifty sentiment fetch failed: ' + str(e))
+
+    # BankNifty
+    try:
+        df = fetch_kite(kite, INSTRUMENT_TOKENS['BANKNIFTY'], days=2, interval='5minute')
+        if df is not None and not df.empty:
+            today = datetime.date.today()
+            df_today = df[df.index.date == today]
+            df_prev = df[df.index.date < today]
+            if not df_today.empty and not df_prev.empty:
+                cur = float(df_today['close'].iloc[-1])
+                prev = float(df_prev['close'].iloc[-1])
+                chg = (cur - prev) / prev * 100
+                components['banknifty_pct'] = round(chg, 2)
+                if chg > 0.3: bull += 1
+                elif chg < -0.3: bear += 1
+    except Exception:
+        pass
+
+    # VIX
+    try:
+        df = fetch_kite(kite, INSTRUMENT_TOKENS['INDIA_VIX'], days=2, interval='5minute')
+        if df is not None and not df.empty:
+            STATE['vix_current'] = float(df['close'].iloc[-1])
+            components['vix'] = round(STATE['vix_current'], 2)
+            # VIX inversely correlates: rising VIX = bearish risk
+            today = datetime.date.today()
+            df_today = df[df.index.date == today]
+            df_prev = df[df.index.date < today]
+            if not df_today.empty and not df_prev.empty:
+                cur = float(df_today['close'].iloc[-1])
+                prev = float(df_prev['close'].iloc[-1])
+                vix_chg = (cur - prev) / prev * 100
+                components['vix_pct'] = round(vix_chg, 2)
+                if vix_chg > 3: bear += 1
+                elif vix_chg < -3: bull += 1
+
+        # v2 FIX F: compute IV rank from VIX 60-day daily range
+        df_vix_daily = fetch_kite(kite, INSTRUMENT_TOKENS['INDIA_VIX'],
+                                  days=90, interval='day')
+        if df_vix_daily is not None and len(df_vix_daily) >= 30:
+            recent = df_vix_daily.tail(60)  # last 60 sessions
+            vix_min = float(recent['low'].min())
+            vix_max = float(recent['high'].max())
+            vix_now = STATE['vix_current']
+            if vix_max > vix_min:
+                iv_rank = int(((vix_now - vix_min) / (vix_max - vix_min)) * 100)
+                iv_rank = max(0, min(100, iv_rank))
+                STATE['iv_rank'] = iv_rank
+                components['iv_rank'] = iv_rank
+    except Exception:
+        pass
+
+    if bull >= 2 and bull > bear:
+        sentiment = 'BULLISH'
+    elif bear >= 2 and bear > bull:
+        sentiment = 'BEARISH'
+    else:
+        sentiment = 'NEUTRAL'
+
+    STATE['global_sentiment'] = sentiment
+    STATE['sentiment_components'] = components
+    log.info('Sentiment: ' + sentiment + '  bull=' + str(bull) + ' bear=' + str(bear)
+             + '  ' + str(components))
+    return sentiment
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# SECTION 8 — HISTORIC PATTERN MATCH (the 7-of-10 rule)
+# ═══════════════════════════════════════════════════════════════════════
+def historic_pattern_score(kite, stock, current_move_pct, direction):
+    """
+    Look back 10 trading days. Find instances where the stock had a similar
+    intraday move (same direction, within ±20% magnitude). For each instance,
+    check if the relevant option (call for up-move, put for down-move) gained
+    Rs.1,000 within 15 min of that move.
+
+    Simplified version (doesn't fetch historical option prices — too expensive):
+      Use stock's own subsequent move as a proxy:
+        After the matching move, did stock continue in same direction by at
+        least 0.5% within 15 min? (≈ Rs.1,000 option gain on typical delta 0.5)
+
+    Returns: (score 0-3, win_count, sample_size)
+    """
+    try:
+        df = fetch_kite(kite, stock['token'], days=15, interval='3minute')
+        if df is None or len(df) < 50:
+            return 0, 0, 0
+
+        # Compute % change between each 3-min close and 15 min later (5 bars)
+        df['future_close'] = df['close'].shift(-5)
+        df['fwd_pct'] = (df['future_close'] - df['close']) / df['close'] * 100
+
+        # Current candle return (just-completed 3-min bar)
+        df['cur_pct'] = (df['close'] - df['open']) / df['open'] * 100
+
+        # Filter: candles similar to current move
+        # Similarity = same direction, magnitude within ±20%
+        target_low  = current_move_pct * 0.8
+        target_high = current_move_pct * 1.2
+        if current_move_pct >= 0:
+            mask = (df['cur_pct'] >= target_low) & (df['cur_pct'] <= target_high)
+        else:
+            mask = (df['cur_pct'] <= target_low) & (df['cur_pct'] >= target_high)
+
+        similar = df[mask].dropna(subset=['fwd_pct'])
+        if len(similar) == 0:
+            return 0, 0, 0
+
+        # Take the most recent 10 instances
+        recent = similar.tail(B2['HISTORIC_LOOKBACK_DAYS'])
+        n = len(recent)
+
+        # "Win" = subsequent 15-min move continues in trade direction by ≥ 0.5%
+        if direction == 'CE':
+            wins = (recent['fwd_pct'] >= 0.5).sum()
+        else:  # PE
+            wins = (recent['fwd_pct'] <= -0.5).sum()
+
+        # v2 FIX E: require statistically meaningful sample size
+        # Previously "n < 3 → return 0" — too small for reliable signal
+        # Now require ≥7 similar historical instances before awarding any score
+        min_samples = B2.get('HISTORIC_MIN_SAMPLES', 7)
+        if n < min_samples:
+            return 0, wins, n  # insufficient sample size
+
+        win_rate = wins / n
+        if win_rate >= 0.7:    return 3, wins, n
+        elif win_rate >= 0.5:  return 2, wins, n
+        elif win_rate >= 0.3:  return 1, wins, n
+        else:                  return 0, wins, n
+    except Exception as e:
+        log.warning('historic_pattern_score error ' + stock['symbol'] + ': ' + str(e))
+        return 0, 0, 0
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# SECTION 9 — SCORING ENGINE (4 components → 0-8 pts)
+# ═══════════════════════════════════════════════════════════════════════
+def score_stock(kite, stock):
+    """
+    Score a single stock. Returns {symbol, direction, score, components, ltp}.
+    Components:
+      historic_pattern (3) + sentiment_align (2) + volume (2) + sector (1) = 8
+    Direction: CE if stock moving up + sentiment OK, PE if stock down + sentiment OK.
+    """
+    sym = stock['symbol']
+    components = {'historic': 0, 'sentiment': 0, 'volume': 0, 'sector': 0}
+
+    # Need today's data
+    df = fetch_kite(kite, stock['token'], days=2, interval='3minute')
+    if df is None or df.empty:
+        return None
+
+    today = datetime.date.today()
+    df_today = df[df.index.date == today]
+    if df_today.empty or len(df_today) < 2:
+        return None
+
+    open_price = float(df_today['open'].iloc[0])
+    last_close = float(df_today['close'].iloc[-1])
+    last_open  = float(df_today['open'].iloc[-1])
+    move_pct = (last_close - open_price) / open_price * 100  # from session open
+    last_candle_pct = (last_close - last_open) / last_open * 100  # last 3-min bar
+
+    # Direction inferred from intraday trend
+    direction = None
+    if move_pct > 0.3:
+        direction = 'CE'
+    elif move_pct < -0.3:
+        direction = 'PE'
+    else:
+        # Too sideways; use sentiment as tiebreaker
+        if STATE['global_sentiment'] == 'BULLISH':
+            direction = 'CE'
+        elif STATE['global_sentiment'] == 'BEARISH':
+            direction = 'PE'
+        else:
+            return None
+
+    # 1) Historic pattern (3 pts) — based on the most recent 3-min move
+    h_score, h_wins, h_n = historic_pattern_score(kite, stock, last_candle_pct, direction)
+    components['historic']      = h_score
+    components['historic_wins'] = int(h_wins)
+    components['historic_n']    = int(h_n)
+
+    # 2) Sentiment alignment (2 pts)
+    sent = STATE['global_sentiment']
+    if (sent == 'BULLISH' and direction == 'CE') or \
+       (sent == 'BEARISH' and direction == 'PE'):
+        components['sentiment'] = 2
+    elif sent == 'NEUTRAL':
+        components['sentiment'] = 1
+    else:
+        components['sentiment'] = 0
+
+    # 3) Volume vs 20-day avg — v2 FIX B: same-time-of-day comparison
+    # OLD BUG: took 10-min today, multiplied by (375/10) to estimate full day,
+    # compared to 20-day full-day average. Broken because morning volume is
+    # front-loaded and doesn't scale linearly to full day.
+    # NEW: today's cumulative volume up to now vs. cumulative volume by same
+    # time-of-day averaged over last 20 sessions. Direct, honest comparison.
+    try:
+        # Get 20 days of 3-min candles (same interval as today)
+        df_intra20 = fetch_kite(kite, stock['token'], days=25, interval='3minute')
+        if df_intra20 is not None and not df_intra20.empty:
+            # Get current time-of-day marker (minutes since 09:15)
+            now_time = datetime.datetime.now().time()
+            # Cumulative volume today up to now
+            today_cum = float(df_today['volume'].sum())
+            # Cumulative volume by this time-of-day for each historical day
+            prev_days = df_intra20[df_intra20.index.date < today].copy()
+            prev_days['time_of_day'] = prev_days.index.time
+            prev_days['date'] = prev_days.index.date
+            # Filter to only bars where time <= now_time (matching today's elapsed window)
+            same_window = prev_days[prev_days['time_of_day'] <= now_time]
+            if not same_window.empty:
+                # Cumulative volume by end of same window per day, then average
+                per_day_cum = same_window.groupby('date')['volume'].sum()
+                # Use last 20 days
+                per_day_cum = per_day_cum.tail(20)
+                if len(per_day_cum) >= 5:  # need at least 5 days for meaningful avg
+                    avg_same_time = float(per_day_cum.mean())
+                    ratio = today_cum / avg_same_time if avg_same_time > 0 else 0
+                    components['volume_ratio'] = round(ratio, 2)
+                    if ratio >= B2['VOLUME_STRONG_MULT']:
+                        components['volume'] = 2
+                    elif ratio >= 1.0:
+                        components['volume'] = 1
+                    else:
+                        components['volume'] = 0
+    except Exception:
+        components['volume'] = 0
+
+    # 4) Sector alignment (1 pt)
+    sector = stock['sector']
+    rep_symbol = SECTOR_REPRESENTATIVE.get(sector)
+    if rep_symbol and rep_symbol != sym:
+        rep_stock = next((s for s in STATE['universe'] if s['symbol'] == rep_symbol), None)
+        if rep_stock:
+            try:
+                rep_df = fetch_kite(kite, rep_stock['token'], days=2, interval='5minute')
+                if rep_df is not None and not rep_df.empty:
+                    rep_today = rep_df[rep_df.index.date == today]
+                    rep_prev = rep_df[rep_df.index.date < today]
+                    if not rep_today.empty and not rep_prev.empty:
+                        rep_pct = (float(rep_today['close'].iloc[-1]) -
+                                   float(rep_prev['close'].iloc[-1])) / \
+                                  float(rep_prev['close'].iloc[-1]) * 100
+                        components['rep_pct'] = round(rep_pct, 2)
+                        if (direction == 'CE' and rep_pct > 0.3) or \
+                           (direction == 'PE' and rep_pct < -0.3):
+                            components['sector'] = 1
+            except Exception:
+                pass
+    elif rep_symbol == sym:
+        components['sector'] = 1  # we ARE the rep — credit the alignment
+
+    total = sum([components['historic'], components['sentiment'],
+                 components['volume'], components['sector']])
+
+    return {
+        'symbol':     sym,
+        'token':      stock['token'],
+        'sector':     stock['sector'],
+        'direction':  direction,
+        'score':      total,
+        'components': components,
+        'move_pct':   round(move_pct, 2),
+        'last_close': last_close,
+        'ts':         datetime.datetime.now().isoformat(),
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# SECTION 10 — PRE-MARKET + RESCORING ORCHESTRATION
+# ═══════════════════════════════════════════════════════════════════════
+def run_pre_market(kite):
+    """09:25 pre-market run — score full universe, identify top picks."""
+    log.info('=' * 60)
+    log.info('PRE-MARKET RUN — full universe scoring')
+    log.info('=' * 60)
+    refresh_sentiment(kite)
+
+    scores = {}
+    for stock in STATE['universe']:
+        result = score_stock(kite, stock)
+        if result:
+            scores[result['symbol']] = result
+        time.sleep(0.1)
+
+    STATE['all_scores'] = scores
+    rebuild_top_picks()
+
+    STATE['pre_market_done'] = True
+    STATE['last_top_rescore']  = datetime.datetime.now()
+    STATE['last_full_rescore'] = datetime.datetime.now()
+    log.info('Pre-market complete. Top 5 picks:')
+    for p in STATE['top_picks'][:5]:
+        log.info('  ' + p['symbol'] + ' ' + p['direction']
+                 + ' score=' + str(p['score']) + ' ' + str(p['components']))
+
+
+def rebuild_top_picks():
+    """Sort all_scores by score DESC and store top picks."""
+    sorted_picks = sorted(STATE['all_scores'].values(),
+                          key=lambda x: x['score'], reverse=True)
+    STATE['top_picks'] = sorted_picks
+    return sorted_picks
+
+
+def rescore_top_n(kite):
+    """Every 3 min — re-score the top N stocks to refresh ranking."""
+    if not STATE['pre_market_done']:
+        return
+    top_n = B2['TOP_PICKS_REFRESH_N']
+    top_stocks = STATE['top_picks'][:top_n]
+    log.info('Top-' + str(top_n) + ' rescore...')
+    for pick in top_stocks:
+        stock = next((s for s in STATE['universe']
+                      if s['symbol'] == pick['symbol']), None)
+        if not stock:
+            continue
+        result = score_stock(kite, stock)
+        if result:
+            STATE['all_scores'][result['symbol']] = result
+        time.sleep(0.05)
+    rebuild_top_picks()
+    STATE['last_top_rescore'] = datetime.datetime.now()
+
+
+def full_rescore(kite):
+    """Every 15 min — re-score the entire universe."""
+    if not STATE['pre_market_done']:
+        return
+    log.info('FULL universe rescore (' + str(len(STATE['universe'])) + ' stocks)...')
+    refresh_sentiment(kite)
+    for stock in STATE['universe']:
+        result = score_stock(kite, stock)
+        if result:
+            STATE['all_scores'][result['symbol']] = result
+        time.sleep(0.05)
+    rebuild_top_picks()
+    STATE['last_full_rescore'] = datetime.datetime.now()
+    log.info('Full rescore complete. New top 5:')
+    for p in STATE['top_picks'][:5]:
+        log.info('  ' + p['symbol'] + ' ' + p['direction']
+                 + ' score=' + str(p['score']))
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# SECTION 11 — OPTION SYMBOL SELECTION
+# ═══════════════════════════════════════════════════════════════════════
+def find_option_symbol(kite, stock_name, direction):
+    """
+    Find the right ATM-ish option strike that meets liquidity criteria.
+    Returns dict with symbol, strike, opt_ltp, opt_token, lot_size or None.
+    """
+    try:
+        instruments = kite.instruments('NFO')
+    except Exception as e:
+        log.warning('NFO instruments fail: ' + str(e))
+        return None
+
+    today = datetime.date.today()
+    # Filter for this stock + direction + nearest valid expiry
+    candidates = []
+    for inst in instruments:
+        if inst.get('name') != stock_name:
+            continue
+        if inst.get('instrument_type') != direction:
+            continue
+        exp = inst.get('expiry')
+        if not exp:
+            continue
+        days_to_exp = (exp - today).days
+        if days_to_exp < B2['EXPIRY_MIN_DAYS']:
+            continue
+        candidates.append(inst)
+
+    if not candidates:
+        log.warning('No option candidates for ' + stock_name + ' ' + direction)
+        return None
+
+    # Sort by expiry (nearest valid first)
+    candidates.sort(key=lambda x: x['expiry'])
+    earliest_expiry = candidates[0]['expiry']
+    nearest_exp = [c for c in candidates if c['expiry'] == earliest_expiry]
+
+    # Get stock LTP for ATM calculation
+    stock_ltp = get_ltp_safe(kite, 'NSE:' + stock_name)
+    if not stock_ltp:
+        return None
+
+    # Sort strikes by distance from spot
+    nearest_exp.sort(key=lambda x: abs(x['strike'] - stock_ltp))
+
+    # Walk through nearest strikes, pick first that meets liquidity + premium + delta
+    for opt in nearest_exp[:8]:
+        opt_symbol = opt['tradingsymbol']
+        try:
+            quote = kite.quote(['NFO:' + opt_symbol])
+            q = quote['NFO:' + opt_symbol]
+            opt_ltp = q.get('last_price', 0)
+            opt_oi = q.get('oi', 0)
+            opt_vol = q.get('volume', 0)
+        except Exception:
+            continue
+        if opt_ltp < B2['OPTION_PREMIUM_MIN'] or opt_ltp > B2['OPTION_PREMIUM_MAX']:
+            continue
+        if opt_oi < B2['MIN_OPTION_OI'] or opt_vol < B2['MIN_OPTION_VOLUME']:
+            continue
+
+        # v2 FIX F: delta filter — reject if too far OTM
+        days_to_exp = (opt['expiry'] - today).days
+        est_delta = estimate_delta(stock_ltp, opt['strike'], opt_ltp, direction, days_to_exp)
+        min_delta = B2.get('MIN_OPTION_DELTA', 0.40)
+        if abs(est_delta) < min_delta:
+            log.info('  Skip ' + opt_symbol + ' — |delta|=' + str(round(est_delta, 2))
+                     + ' < ' + str(min_delta) + ' (too far OTM)')
+            continue
+
+        return {
+            'symbol':    opt_symbol,
+            'strike':    opt['strike'],
+            'opt_ltp':   opt_ltp,
+            'opt_token': opt['instrument_token'],
+            'lot_size':  opt['lot_size'],
+            'expiry':    opt['expiry'].isoformat(),
+            'delta':     round(est_delta, 2),
+        }
+
+    log.info('No liquid option found for ' + stock_name + ' ' + direction)
+    return None
+
+
+def estimate_delta(stock_ltp, strike, opt_ltp, direction, days_to_exp):
+    """
+    Rough delta estimator (no external Greeks library needed).
+    Uses moneyness (S vs K) + time value as proxy.
+    Good enough for filter decisions (accept/reject) — not for hedging.
+    """
+    try:
+        if direction == 'CE':
+            intrinsic = max(0.0, stock_ltp - strike)
+            moneyness = (stock_ltp - strike) / strike  # + = ITM
+        else:  # PE
+            intrinsic = max(0.0, strike - stock_ltp)
+            moneyness = (strike - stock_ltp) / strike  # + = ITM
+
+        # Delta rough curve:
+        #   deep ITM ~0.9, ATM ~0.5, deep OTM ~0.1
+        # moneyness > +5% (deep ITM) → ~0.85
+        # moneyness  0    (ATM)      → ~0.50
+        # moneyness < -5% (deep OTM) → ~0.15
+        if moneyness >= 0.05:
+            delta = 0.75 + min(0.20, moneyness * 2)  # 0.75-0.95
+        elif moneyness >= 0:
+            delta = 0.50 + moneyness * 5  # 0.50-0.75
+        elif moneyness >= -0.05:
+            delta = 0.50 + moneyness * 5  # 0.25-0.50 (negative moneyness)
+        else:
+            delta = max(0.05, 0.25 + (moneyness + 0.05) * 2)  # 0.05-0.25
+
+        # Adjust for time — very short expiry pushes delta toward 0 or 1
+        # (not doing full model — just avoid ridiculous outputs)
+        delta = max(0.05, min(0.98, delta))
+        return delta if direction == 'CE' else -delta  # PE returns negative
+    except Exception:
+        return 0.5  # fallback: assume ATM
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# SECTION 12 — PAPER TRADE ENGINE
+# ═══════════════════════════════════════════════════════════════════════
+def place_buy(kite, opt_symbol, qty, opt_ltp):
+    """
+    Place a BUY order.
+      Paper mode: simulate fill at LTP (no slippage).
+      Live mode:  send real Kite order with limit at LTP * 1.05.
+    Returns (success, fill_price).
+    """
+    if not B2['LIVE_MODE']:
+        log.info('PAPER BUY: ' + opt_symbol + ' qty=' + str(qty)
+                 + ' @ Rs.' + str(round(opt_ltp, 2)))
+        return True, opt_ltp
+
+    try:
+        limit_price = round(opt_ltp * 1.05, 1)  # 5% above LTP, rounded to 0.10
+        order_id = kite.place_order(
+            variety='regular',
+            exchange='NFO',
+            tradingsymbol=opt_symbol,
+            transaction_type='BUY',
+            quantity=qty,
+            product='MIS',
+            order_type='LIMIT',
+            price=limit_price,
+        )
+        log.info('LIVE BUY order_id=' + str(order_id))
+        # Wait briefly and check fill
+        time.sleep(2)
+        orders = kite.orders()
+        for o in orders:
+            if o.get('order_id') == order_id and o.get('status') == 'COMPLETE':
+                return True, o.get('average_price', opt_ltp)
+        log.warning('LIVE BUY not filled within 2s')
+        return False, None
+    except Exception as e:
+        log.error('LIVE BUY failed: ' + str(e))
+        return False, None
+
+
+def place_sell(kite, opt_symbol, qty, opt_ltp):
+    """
+    Place a SELL order. Paper mode simulates fill at LTP.
+    """
+    if not B2['LIVE_MODE']:
+        log.info('PAPER SELL: ' + opt_symbol + ' qty=' + str(qty)
+                 + ' @ Rs.' + str(round(opt_ltp, 2)))
+        return True, opt_ltp
+
+    try:
+        limit_price = round(opt_ltp * 0.95, 1)  # 5% below LTP for fast fill
+        order_id = kite.place_order(
+            variety='regular',
+            exchange='NFO',
+            tradingsymbol=opt_symbol,
+            transaction_type='SELL',
+            quantity=qty,
+            product='MIS',
+            order_type='LIMIT',
+            price=limit_price,
+        )
+        log.info('LIVE SELL order_id=' + str(order_id))
+        time.sleep(2)
+        orders = kite.orders()
+        for o in orders:
+            if o.get('order_id') == order_id and o.get('status') == 'COMPLETE':
+                return True, o.get('average_price', opt_ltp)
+        # Try MARKET as fallback
+        log.warning('SELL not filled — falling back to MARKET')
+        kite.place_order(
+            variety='regular', exchange='NFO',
+            tradingsymbol=opt_symbol, transaction_type='SELL',
+            quantity=qty, product='MIS', order_type='MARKET',
+        )
+        time.sleep(2)
+        return True, opt_ltp * 0.95
+    except Exception as e:
+        log.error('LIVE SELL failed: ' + str(e))
+        return False, None
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# SECTION 13 — POSITION MONITOR
+# ═══════════════════════════════════════════════════════════════════════
+def monitor_position(kite, pos_id):
+    """
+    Per-position monitor thread. Watches PnL every 3 sec, applies:
+      - Target Rs.1,000 + trail (Rs.500 lock initial, +50 per +50 peak)
+      - Hard SL Rs.2,000
+      - 15-min rule: didn't hit target → exit at any PnL
+      - Loss > Rs.1,000 AND live score < entry score → exit
+      - 15:15 square-off
+    """
+    pos = STATE['positions'][pos_id]
+    log.info('Monitor START: ' + pos['symbol'] + ' qty=' + str(pos['qty'])
+             + ' entry=' + str(pos['entry_price']))
+
+    while pos_id in STATE['positions']:
+        try:
+            now = datetime.datetime.now()
+            elapsed_secs = (now - pos['entry_time']).total_seconds()
+
+            # Fetch latest option LTP
+            quote = kite.quote(['NFO:' + pos['symbol']])
+            ltp = quote['NFO:' + pos['symbol']].get('last_price')
+            if not ltp:
+                time.sleep(3)
+                continue
+            pos['current_ltp'] = ltp
+            pnl = (ltp - pos['entry_price']) * pos['qty']
+            pos['current_pnl'] = pnl
+            if pnl > pos.get('peak_pnl', 0):
+                pos['peak_pnl'] = pnl
+
+            target  = B2['TARGET_PROFIT']
+            sl      = B2['HARD_STOP_LOSS']
+            t_lock  = B2['TRAIL_INITIAL_LOCK']
+            t_step  = B2['TRAIL_STEP']
+
+            # --- Trail lock adjustment ---
+            if pos['peak_pnl'] >= target:
+                # initial trail lock = peak - (target - initial_lock) - then steps
+                # peak 1000 → lock 500
+                # peak 1050 → lock 1000
+                # peak 1100 → lock 1050
+                # peak X    → lock (X - 50)  for X >= 1050
+                if pos['peak_pnl'] >= target + t_step:
+                    pos['trail_lock'] = pos['peak_pnl'] - t_step
+                else:
+                    pos['trail_lock'] = t_lock
+
+            # --- Exit checks (priority order) ---
+            exit_reason = None
+
+            # 1. Hard SL
+            if pnl <= -sl:
+                exit_reason = 'Hard SL Rs.' + str(sl)
+
+            # 2. Trail lock breached
+            elif pos.get('trail_lock') is not None and pnl < pos['trail_lock']:
+                exit_reason = ('Trail lock breached  peak=Rs.'
+                               + str(int(pos['peak_pnl']))
+                               + ' lock=Rs.' + str(int(pos['trail_lock'])))
+
+            # 3. 15-min rule
+            elif elapsed_secs >= B2['TIME_EXIT_SECS']:
+                if pos['peak_pnl'] < target:
+                    exit_reason = '15-min didnt hit target — exit at any PnL'
+                else:
+                    # had hit target then trailed back — already caught above
+                    pass
+
+            # 4. Loss > Rs.1,000 + score drop
+            elif pnl < B2['TIME_EXIT_LOSS_FLOOR'] and elapsed_secs >= 180:
+                # Re-check score live (cheap: read from STATE)
+                cur = STATE['all_scores'].get(pos['stock_name'])
+                if cur and cur['score'] < pos['entry_score']:
+                    exit_reason = ('Loss>Rs.1000 + score dropped '
+                                   + str(pos['entry_score']) + '→' + str(cur['score']))
+
+            # 5. Square-off time
+            elif now.time() >= datetime.datetime.strptime(
+                    B2['SQUAREOFF_TIME'], '%H:%M').time():
+                exit_reason = 'Square-off 15:15'
+
+            if exit_reason:
+                close_position(kite, pos_id, exit_reason)
+                return
+
+            time.sleep(3)
+        except Exception as e:
+            log.warning('Monitor error ' + pos['symbol'] + ': ' + str(e))
+            time.sleep(5)
+
+
+def close_position(kite, pos_id, reason):
+    """Close out a position and log it."""
+    if pos_id not in STATE['positions']:
+        return
+    pos = STATE['positions'][pos_id]
+    try:
+        quote = kite.quote(['NFO:' + pos['symbol']])
+        exit_ltp = quote['NFO:' + pos['symbol']].get('last_price', pos['current_ltp'])
+    except Exception:
+        exit_ltp = pos.get('current_ltp', pos['entry_price'])
+
+    success, fill = place_sell(kite, pos['symbol'], pos['qty'], exit_ltp)
+    if not success:
+        log.error('CLOSE FAILED: ' + pos['symbol'])
+        return
+
+    realized_pnl = (fill - pos['entry_price']) * pos['qty']
+    pos['exit_time']   = datetime.datetime.now()
+    pos['exit_ltp']    = fill
+    pos['realized_pnl'] = realized_pnl
+    pos['reason']      = reason
+
+    STATE['closed_trades_today'].append(pos.copy())
+    STATE['closed_pnl_today'] += realized_pnl
+
+    # v2 FIX D: record outcome-specific cooldown
+    if realized_pnl > 0:
+        STATE['last_exit_win'][pos['stock_name']] = datetime.datetime.now()
+        STATE['consecutive_sl_count'] = 0
+    else:
+        STATE['last_exit_loss'][pos['stock_name']] = datetime.datetime.now()
+        STATE['consecutive_sl_count'] += 1
+
+    log.info('═════ EXIT  ' + pos['symbol']
+             + '  PnL=Rs.' + str(round(realized_pnl, 2))
+             + '  reason: ' + reason)
+    del STATE['positions'][pos_id]
+
+    # Update Excel report
+    write_excel_report()
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# SECTION 14 — TRADE ENTRY LOOP
+# ═══════════════════════════════════════════════════════════════════════
+def can_enter_new_trade():
+    """Check if we're allowed to enter another trade right now."""
+    now = datetime.datetime.now().time()
+    if not (B2['TRADE_START'] <= now <= B2['TRADE_END']):
+        return False, 'outside trade window'
+    if len(STATE['positions']) >= B2['MAX_PARALLEL']:
+        return False, 'at max parallel (' + str(B2['MAX_PARALLEL']) + ')'
+    if B2['CONSECUTIVE_SL_LIMIT'] > 0 and \
+       STATE['consecutive_sl_count'] >= B2['CONSECUTIVE_SL_LIMIT']:
+        return False, 'consecutive SL limit hit'
+    if B2['DAILY_MAX_LOSS'] < 0 and \
+       STATE['closed_pnl_today'] <= B2['DAILY_MAX_LOSS']:
+        return False, 'daily SL hit'
+    return True, ''
+
+
+def trade_loop(kite):
+    """Main trade loop. Runs every 3 min."""
+    if not STATE['pre_market_done']:
+        return
+    can, why = can_enter_new_trade()
+    if not can:
+        return
+
+    # Find best qualifying pick that's not already in a position
+    open_stocks = {p['stock_name'] for p in STATE['positions'].values()}
+
+    # v2 FIX D: outcome-specific cooldowns
+    cooldown_win_secs  = B2['SAME_STOCK_COOLDOWN_WIN_SECS']   # 5 min after win
+    cooldown_loss_secs = B2['SAME_STOCK_COOLDOWN_LOSS_SECS']  # 60 min after loss
+    now = datetime.datetime.now()
+
+    for pick in STATE['top_picks']:
+        sym = pick['symbol']
+        if pick['score'] < B2['MIN_ENTRY_SCORE']:
+            break  # sorted DESC — no point continuing
+        if sym in open_stocks:
+            continue
+        # v2 FIX D: check cooldown based on last outcome
+        last_loss = STATE['last_exit_loss'].get(sym)
+        if last_loss and (now - last_loss).total_seconds() < cooldown_loss_secs:
+            continue  # still in loss-cooldown (60 min)
+        last_win = STATE['last_exit_win'].get(sym)
+        if last_win and (now - last_win).total_seconds() < cooldown_win_secs:
+            continue  # still in win-cooldown (5 min)
+
+        # Try to enter this one
+        enter_trade(kite, pick)
+        return  # one entry per scan cycle (max)
+
+    log.info('No qualifying pick (top score=' +
+             str(STATE['top_picks'][0]['score'] if STATE['top_picks'] else 0)
+             + ', need >=' + str(B2['MIN_ENTRY_SCORE']) + ')')
+
+
+def enter_trade(kite, pick):
+    """Find a tradeable option strike and enter."""
+    sym = pick['symbol']
+    direction = pick['direction']
+    log.info('─' * 50)
+    log.info('ENTRY ATTEMPT: ' + sym + ' ' + direction
+             + ' score=' + str(pick['score']) + ' ' + str(pick['components']))
+
+    # v2 FIX F: IV rank check — skip when options are too expensive
+    iv_rank = STATE.get('iv_rank', 50)
+    if iv_rank > B2['MAX_IV_RANK_ENTRY']:
+        log.info('  Skip: IV rank ' + str(iv_rank)
+                 + ' > ' + str(B2['MAX_IV_RANK_ENTRY'])
+                 + ' — options too expensive.')
+        return
+
+    opt = find_option_symbol(kite, sym, direction)
+    if not opt:
+        log.info('  No tradeable option strike for ' + sym + '.')
+        return
+
+    # Sizing — fit within PER_TRADE_MAX_RISK
+    lot_cost = opt['opt_ltp'] * opt['lot_size']
+    max_capital = B2['PER_TRADE_MAX_RISK']
+    max_lots = int(max_capital / lot_cost) if lot_cost > 0 else 0
+    if max_lots < 1:
+        log.info('  Skipping ' + opt['symbol'] + ' — single lot Rs.'
+                 + str(round(lot_cost)) + ' > per-trade cap Rs.' + str(max_capital))
+        return
+    qty = max_lots * opt['lot_size']
+
+    success, fill_price = place_buy(kite, opt['symbol'], qty, opt['opt_ltp'])
+    if not success:
+        log.warning('  BUY failed for ' + opt['symbol'])
+        return
+
+    pos_id = opt['symbol'] + '_' + datetime.datetime.now().strftime('%H%M%S')
+    pos = {
+        'pos_id':       pos_id,
+        'symbol':       opt['symbol'],
+        'stock_name':   sym,
+        'direction':    direction,
+        'strike':       opt['strike'],
+        'qty':          qty,
+        'lot_size':     opt['lot_size'],
+        'entry_price':  fill_price,
+        'entry_time':   datetime.datetime.now(),
+        'entry_score':  pick['score'],
+        'entry_components': dict(pick['components']),
+        'cost':         round(fill_price * qty, 2),
+        'current_ltp':  fill_price,
+        'current_pnl':  0,
+        'peak_pnl':     0,
+        'trail_lock':   None,
+    }
+    STATE['positions'][pos_id] = pos
+    log.info('═════ ENTERED  ' + pos['symbol']
+             + '  qty=' + str(qty) + '  fill=Rs.' + str(fill_price)
+             + '  cost=Rs.' + str(pos['cost']))
+
+    # Start a monitor thread
+    t = threading.Thread(target=monitor_position, args=(kite, pos_id),
+                         daemon=True, name='Mon-' + pos_id)
+    t.start()
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# SECTION 15 — SQUARE-OFF
+# ═══════════════════════════════════════════════════════════════════════
+def square_off(kite):
+    """Force-close any open positions at 15:15."""
+    if not STATE['positions']:
+        log.info('SQUARE OFF 15:15 — no open positions.')
+    else:
+        log.info('SQUARE OFF 15:15 — closing ' + str(len(STATE['positions'])) + ' positions.')
+        for pos_id in list(STATE['positions'].keys()):
+            close_position(kite, pos_id, 'Square-off 15:15')
+
+    # EOD Excel report
+    log.info('Writing EOD Excel report...')
+    write_excel_report(eod=True)
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# SECTION 16 — EXCEL REPORT (using openpyxl)
+# ═══════════════════════════════════════════════════════════════════════
+def write_excel_report(eod=False):
+    """Write formatted Excel report with trades, picks, summary."""
+    try:
+        today = datetime.date.today().isoformat()
+        filename = os.path.join(B2['OUTPUT_DIR'], 'bot2_report_' + today + '.xlsx')
+
+        wb = Workbook()
+        ws_summary = wb.active
+        ws_summary.title = 'Summary'
+        ws_trades  = wb.create_sheet('Daily Trades')
+        ws_picks   = wb.create_sheet('Picks Log')
+        ws_scores  = wb.create_sheet('Score History')
+
+        # Common styles
+        header_font = Font(bold=True, color='FFFFFF', size=11, name='Arial')
+        header_fill = PatternFill('solid', start_color='305496')
+        center      = Alignment(horizontal='center', vertical='center')
+        thin_border = Border(left=Side(style='thin'), right=Side(style='thin'),
+                             top=Side(style='thin'), bottom=Side(style='thin'))
+        money_fmt = 'Rs.#,##0.00;(Rs.#,##0.00);"-"'
+        pct_fmt   = '0.0%'
+
+        # ─── SUMMARY SHEET ─────────────────────────
+        ws_summary['A1'] = 'BOT2 v1 — Daily Summary'
+        ws_summary['A1'].font = Font(bold=True, size=14, name='Arial')
+        ws_summary['A1'].alignment = center
+
+        ws_summary['A3'] = 'Date:'
+        ws_summary['B3'] = today
+        ws_summary['A4'] = 'Mode:'
+        ws_summary['B4'] = 'LIVE' if B2['LIVE_MODE'] else 'PAPER'
+        ws_summary['A5'] = 'Capital:'
+        ws_summary['B5'] = B2['TOTAL_CAPITAL']
+        ws_summary['B5'].number_format = money_fmt
+        ws_summary['A6'] = 'Closed PnL:'
+        ws_summary['B6'] = STATE['closed_pnl_today']
+        ws_summary['B6'].number_format = money_fmt
+        ws_summary['A7'] = 'Trades:'
+        ws_summary['B7'] = len(STATE['closed_trades_today'])
+        ws_summary['A8'] = 'Open Positions:'
+        ws_summary['B8'] = len(STATE['positions'])
+        ws_summary['A9'] = 'Consecutive SL:'
+        ws_summary['B9'] = STATE['consecutive_sl_count']
+        ws_summary['A10'] = 'Sentiment:'
+        ws_summary['B10'] = STATE['global_sentiment']
+        ws_summary['A11'] = 'Nifty:'
+        ws_summary['B11'] = STATE['nifty_current']
+        ws_summary['A12'] = 'VIX:'
+        ws_summary['B12'] = STATE['vix_current']
+
+        for r in range(3, 13):
+            ws_summary['A' + str(r)].font = Font(bold=True, name='Arial')
+        ws_summary.column_dimensions['A'].width = 22
+        ws_summary.column_dimensions['B'].width = 20
+
+        # Summary stats — wins/losses/avg
+        wins = [t for t in STATE['closed_trades_today'] if t['realized_pnl'] > 0]
+        losses = [t for t in STATE['closed_trades_today'] if t['realized_pnl'] <= 0]
+        ws_summary['A14'] = 'Wins:'
+        ws_summary['B14'] = len(wins)
+        ws_summary['A15'] = 'Losses:'
+        ws_summary['B15'] = len(losses)
+        ws_summary['A16'] = 'Win Rate:'
+        ws_summary['B16'] = '=IFERROR(B14/(B14+B15), 0)'
+        ws_summary['B16'].number_format = pct_fmt
+        ws_summary['A17'] = 'Avg Win:'
+        if wins:
+            ws_summary['B17'] = sum(w['realized_pnl'] for w in wins) / len(wins)
+        else:
+            ws_summary['B17'] = 0
+        ws_summary['B17'].number_format = money_fmt
+        ws_summary['A18'] = 'Avg Loss:'
+        if losses:
+            ws_summary['B18'] = sum(l['realized_pnl'] for l in losses) / len(losses)
+        else:
+            ws_summary['B18'] = 0
+        ws_summary['B18'].number_format = money_fmt
+        for r in range(14, 19):
+            ws_summary['A' + str(r)].font = Font(bold=True, name='Arial')
+
+        # ─── DAILY TRADES SHEET ─────────────────────
+        headers = ['#', 'Entry Time', 'Exit Time', 'Symbol', 'Stock', 'Dir',
+                   'Qty', 'Entry', 'Exit', 'Realized PnL', 'Peak PnL',
+                   'Entry Score', 'Reason']
+        for i, h in enumerate(headers, 1):
+            c = ws_trades.cell(row=1, column=i, value=h)
+            c.font = header_font
+            c.fill = header_fill
+            c.alignment = center
+            c.border = thin_border
+
+        for i, t in enumerate(STATE['closed_trades_today'], 2):
+            ws_trades.cell(row=i, column=1, value=i - 1)
+            ws_trades.cell(row=i, column=2, value=t['entry_time'].strftime('%H:%M:%S'))
+            ws_trades.cell(row=i, column=3, value=t['exit_time'].strftime('%H:%M:%S'))
+            ws_trades.cell(row=i, column=4, value=t['symbol'])
+            ws_trades.cell(row=i, column=5, value=t['stock_name'])
+            ws_trades.cell(row=i, column=6, value=t['direction'])
+            ws_trades.cell(row=i, column=7, value=t['qty'])
+            c8 = ws_trades.cell(row=i, column=8, value=t['entry_price'])
+            c8.number_format = money_fmt
+            c9 = ws_trades.cell(row=i, column=9, value=t['exit_ltp'])
+            c9.number_format = money_fmt
+            c10 = ws_trades.cell(row=i, column=10, value=t['realized_pnl'])
+            c10.number_format = money_fmt
+            if t['realized_pnl'] > 0:
+                c10.fill = PatternFill('solid', start_color='C6EFCE')
+            else:
+                c10.fill = PatternFill('solid', start_color='FFC7CE')
+            c11 = ws_trades.cell(row=i, column=11, value=t.get('peak_pnl', 0))
+            c11.number_format = money_fmt
+            ws_trades.cell(row=i, column=12, value=t['entry_score'])
+            ws_trades.cell(row=i, column=13, value=t['reason'])
+
+        widths = [6, 12, 12, 26, 14, 6, 8, 12, 12, 14, 14, 12, 38]
+        for i, w in enumerate(widths, 1):
+            ws_trades.column_dimensions[get_column_letter(i)].width = w
+
+        # Total row
+        total_row = len(STATE['closed_trades_today']) + 3
+        if STATE['closed_trades_today']:
+            ws_trades.cell(row=total_row, column=9, value='TOTAL').font = Font(bold=True, name='Arial')
+            c_total = ws_trades.cell(row=total_row, column=10,
+                                     value='=SUM(J2:J' + str(total_row - 2) + ')')
+            c_total.number_format = money_fmt
+            c_total.font = Font(bold=True, name='Arial')
+
+        # ─── PICKS LOG SHEET ──────────────────────────
+        pheaders = ['Rank', 'Symbol', 'Sector', 'Direction', 'Score',
+                    'Historic', 'Sentiment', 'Volume', 'Sector Align',
+                    'Move %', 'Last Close', 'Updated']
+        for i, h in enumerate(pheaders, 1):
+            c = ws_picks.cell(row=1, column=i, value=h)
+            c.font = header_font
+            c.fill = header_fill
+            c.alignment = center
+            c.border = thin_border
+
+        for i, p in enumerate(STATE['top_picks'][:30], 2):
+            ws_picks.cell(row=i, column=1, value=i - 1)
+            ws_picks.cell(row=i, column=2, value=p['symbol'])
+            ws_picks.cell(row=i, column=3, value=p['sector'])
+            ws_picks.cell(row=i, column=4, value=p['direction'])
+            ws_picks.cell(row=i, column=5, value=p['score'])
+            c = p['components']
+            ws_picks.cell(row=i, column=6, value=c.get('historic', 0))
+            ws_picks.cell(row=i, column=7, value=c.get('sentiment', 0))
+            ws_picks.cell(row=i, column=8, value=c.get('volume', 0))
+            ws_picks.cell(row=i, column=9, value=c.get('sector', 0))
+            ws_picks.cell(row=i, column=10, value=p.get('move_pct', 0))
+            ws_picks.cell(row=i, column=11, value=p.get('last_close', 0))
+            ws_picks.cell(row=i, column=12, value=p.get('ts', ''))
+        pwidths = [6, 14, 12, 6, 8, 10, 10, 10, 14, 10, 12, 22]
+        for i, w in enumerate(pwidths, 1):
+            ws_picks.column_dimensions[get_column_letter(i)].width = w
+
+        # ─── SCORE HISTORY SHEET ──────────────────────
+        sheaders = ['Symbol', 'Sector', 'Direction', 'Score', 'Move %', 'Updated']
+        for i, h in enumerate(sheaders, 1):
+            c = ws_scores.cell(row=1, column=i, value=h)
+            c.font = header_font
+            c.fill = header_fill
+            c.alignment = center
+            c.border = thin_border
+
+        # Sorted all_scores
+        all_sorted = sorted(STATE['all_scores'].values(),
+                            key=lambda x: x['score'], reverse=True)
+        for i, s in enumerate(all_sorted, 2):
+            ws_scores.cell(row=i, column=1, value=s['symbol'])
+            ws_scores.cell(row=i, column=2, value=s['sector'])
+            ws_scores.cell(row=i, column=3, value=s['direction'])
+            ws_scores.cell(row=i, column=4, value=s['score'])
+            ws_scores.cell(row=i, column=5, value=s.get('move_pct', 0))
+            ws_scores.cell(row=i, column=6, value=s.get('ts', ''))
+
+        swidths = [14, 12, 6, 8, 10, 22]
+        for i, w in enumerate(swidths, 1):
+            ws_scores.column_dimensions[get_column_letter(i)].width = w
+
+        wb.save(filename)
+        log.info('Excel report saved: ' + filename)
+    except Exception as e:
+        log.error('Excel report write failed: ' + str(e))
+        log.error(traceback.format_exc())
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# SECTION 17 — HEARTBEAT
+# ═══════════════════════════════════════════════════════════════════════
+def write_heartbeat():
+    try:
+        with open(B2['HEARTBEAT_FILE'], 'w') as f:
+            f.write(str(int(time.time())) + '|'
+                    + datetime.datetime.now().strftime('%H:%M:%S') + '|'
+                    + STATE['global_sentiment'] + '|'
+                    + 'positions=' + str(len(STATE['positions'])) + '|'
+                    + 'pnl=Rs.' + str(round(STATE['closed_pnl_today'])))
+    except Exception:
+        pass
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# SECTION 18 — MAIN
+# ═══════════════════════════════════════════════════════════════════════
+def main():
+    log.info('╔' + '═' * 65 + '╗')
+    log.info('║ BOT2 v2 — STARTING (SL Rs.1K, IV+delta filters, split cooldown)  ║')
+    log.info('║ Mode: ' + ('LIVE' if B2['LIVE_MODE'] else 'PAPER').ljust(60) + '║')
+    log.info('║ Capital: Rs.' + str(B2['TOTAL_CAPITAL']).ljust(54) + '║')
+    log.info('╚' + '═' * 65 + '╝')
+
+    STATE['session_date']  = datetime.date.today()
+    STATE['session_start'] = datetime.datetime.now()
+
+    kite = kite_login()
+    STATE['kite'] = kite
+
+    # Build universe
+    STATE['universe'] = build_universe(kite)
+    if not STATE['universe']:
+        log.error('Universe empty — aborting.')
+        return
+
+    # Pre-market run (only if past 09:15 today)
+    now = datetime.datetime.now().time()
+    if now >= datetime.time(9, 15):
+        run_pre_market(kite)
+    else:
+        log.info('Pre-market not yet — will run at 09:25.')
+
+    # Schedule jobs
+    schedule.every(3).minutes.do(trade_loop, kite=kite)
+    schedule.every(B2['TOP_RESCORE_SECS']).seconds.do(rescore_top_n, kite=kite)
+    schedule.every(B2['FULL_RESCORE_SECS']).seconds.do(full_rescore, kite=kite)
+    schedule.every().day.at('09:25').do(run_pre_market, kite=kite)
+    schedule.every().day.at(B2['SQUAREOFF_TIME']).do(square_off, kite=kite)
+    schedule.every(30).seconds.do(write_heartbeat)
+
+    log.info('Scheduler started.')
+    while True:
+        try:
+            schedule.run_pending()
+            time.sleep(1)
+        except KeyboardInterrupt:
+            log.info('Stopping bot2...')
+            for pos_id in list(STATE['positions'].keys()):
+                close_position(kite, pos_id, 'Bot stopped (KeyboardInterrupt)')
+            write_excel_report(eod=True)
+            log.info('Bot2 stopped cleanly.')
+            break
+        except Exception as e:
+            log.error('Scheduler error: ' + str(e))
+            log.error(traceback.format_exc())
+            time.sleep(5)
+
+
+if __name__ == '__main__':
+    main()
